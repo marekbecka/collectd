@@ -28,32 +28,109 @@
 #include "utils_mount.h"
 #include "utils_ignorelist.h"
 
-#define CGROUP_CPUACCT	0x01
-#define CGROUP_MEMORY	0x02
-#define CGROUP_BLKIO	0x04
+enum cgroup_subsystem
+{
+	CGROUP_SUBSYSTEM_CPUACCT = 0,
+	CGROUP_SUBSYSTEM_BLKIO,
+	CGROUP_SUBSYSTEM_MEMORY
+};
 
-#define CGROUP_SUBS_CPUACCT	1
-#define CGROUP_SUBS_BLKIO	2
-#define CGROUP_SUBS_MEMORY	3
+#define CGROUP_MOUNT_CPUACCT		(1UL << CGROUP_SUBSYSTEM_CPUACCT)
+#define CGROUP_MOUNT_BLKIO		(1UL << CGROUP_SUBSYSTEM_BLKIO)
+#define CGROUP_MOUNT_MEMORY		(1UL << CGROUP_SUBSYSTEM_MEMORY)
 
-static char const *cgroup_subsystems[] =
+static char *cgroup_subsystem_str[] =
 {
 	"cpuacct",
 	"blkio",
 	"memory"
 };
 
+enum cgroup_set
+{
+	CGROUP_SET_CPUACCT_BASIC = 0,
+	CGROUP_SET_BLKIO_BASIC,
+	CGROUP_SET_BLKIO_THROTTLE,
+	CGROUP_SET_MEMORY_BASIC,
+	CGROUP_SET_MEMORY_STAT,
+	CGROUP_SET_MEMORY_KERNEL,
+	CGROUP_SET_MEMORY_TCP,
+	CGROUP_SET_MEMORY_SWAP
+};
+
+#define CGROUP_DO_CPUACCT_BASIC		(1UL << CGROUP_SET_CPUACCT_BASIC)
+
+#define CGROUP_DO_BLKIO_BASIC		(1UL << CGROUP_SET_BLKIO_BASIC)
+#define CGROUP_DO_BLKIO_THROTTLE	(1UL << CGROUP_SET_BLKIO_THROTTLE)
+
+#define CGROUP_DO_MEMORY_BASIC		(1UL << CGROUP_SET_MEMORY_BASIC)
+#define CGROUP_DO_MEMORY_STAT		(1UL << CGROUP_SET_MEMORY_STAT)
+#define CGROUP_DO_MEMORY_KERNEL		(1UL << CGROUP_SET_MEMORY_KERNEL)
+#define CGROUP_DO_MEMORY_TCP		(1UL << CGROUP_SET_MEMORY_TCP)
+#define CGROUP_DO_MEMORY_SWAP		(1UL << CGROUP_SET_MEMORY_SWAP)
+
+static const char *cgroup_set_str[] =
+{
+	"cpuacct",
+	"blkio",
+	"blkio.throttle",
+	"memory",
+	"memory.vmem",
+	"memory.kmem",
+	"memory.kmem.tcp",
+	"memory.memsw"
+};
+
+#define CGROUP_DO_DEFAULT		( CGROUP_DO_CPUACCT_BASIC \
+					| CGROUP_DO_BLKIO_BASIC \
+					| CGROUP_DO_MEMORY_BASIC )
+
+#define CGROUP_DO_ALL			( CGROUP_DO_CPUACCT_BASIC \
+					| CGROUP_DO_BLKIO_BASIC \
+					| CGROUP_DO_BLKIO_THROTTLE \
+					| CGROUP_DO_MEMORY_BASIC \
+					| CGROUP_DO_MEMORY_STAT \
+					| CGROUP_DO_MEMORY_KERNEL \
+					| CGROUP_DO_MEMORY_TCP \
+					| CGROUP_DO_MEMORY_SWAP )
+
 static char const *config_keys[] =
 {
 	"CGroup",
-	"IgnoreSelected"
+	"IgnoreSelected",
+	"Subsystems"
 };
+
+typedef struct cgroup_handler_s 
+{
+	char *filename;
+	int (*func) (const char *cgroup, FILE *fh, void *payload,
+			void *custom_data);
+	void *payload;
+
+} cgroup_handler_t;
+
+typedef struct cgroup_handler_info_s
+{
+	char *value_type;
+	char *value_prefix;
+
+} cgroup_handler_info_t;
+
+
 static int config_keys_num = STATIC_ARRAY_SIZE (config_keys);
 
+static unsigned long do_subsystems = CGROUP_DO_DEFAULT;
+
 static unsigned long pageshift = 0; 
-static unsigned long ignore_subsystems = 0;
 
 static ignorelist_t *il_cgroup = NULL;
+
+
+static int test_bits (unsigned long flags, unsigned long mask)
+{
+	return ((flags & mask) == mask);
+}
 
 static void cgroups_submit (char const *plugin_instance, const char *type,
 		char const *type_instance, value_t *values, size_t values_len)
@@ -89,13 +166,14 @@ __attribute__ ((nonnull(3)))
 static void cgroups_submit_two (char const *plugin_instance, const char *type,
 		char const *type_instance, value_t values[2])
 {
-	cgroups_submit(plugin_instance, type, type_instance, &values, 2);
+	cgroups_submit(plugin_instance, type, type_instance, values, 2);
 } /* void cgroups_submit_two */
 
 __attribute__ ((nonnull(1)))
 __attribute__ ((nonnull(2)))
-static void read_cpuacct_stat (const char *cgroup_name, 
-		void __attribute__((unused)) *payload, FILE *fh)
+static int read_cpuacct_stat (const char *cgroup_name, FILE *fh,
+		void __attribute__((unused)) *payload,
+		void __attribute__((unused)) *custom_data)
 {
 	char buf[128];
 
@@ -132,26 +210,35 @@ static void read_cpuacct_stat (const char *cgroup_name,
 
 		cgroups_submit_one (cgroup_name, "cpu", key, value);
 	}
+
+	return 0;
 }
 
 static value_t bytes_to_numpages (value_t bytes)
 {
-	return (bytes + (pagesize - 1)) >> pageshift;
-/*	return (bytes + (pagesize - 1)) / pagesize; */
+	value_t ret;
+
+	ret.gauge = ((unsigned long) bytes.gauge + ((1UL << pageshift) - 1)) >> pageshift;
+/*	ret.gauge = bytes.gauge / pagesize; */
+
+	return ret;
 }
+
+static int read_memory_stat (const char *cgroup_name, FILE *fh,
+		void __attribute__((unused)) *payload,
+		void __attribute__((unused)) *custom_data)
+{
+	unsigned long parsed_values = 0;
+	char buf[128];
+	value_t inout[2];
+	value_t faults[2];
 
 #define GOT_PGPGIN	0x01
 #define GOT_PGPGOUT	0x02
 #define GOT_PGFAULT	0x04
 #define GOT_PGMAJFAULT	0x08
 
-static void read_memory_stat (const char *cgroup_name,
-		void __attribute__((unused)) *payload, FILE *fh)
-{
-	unsigned long parsed_values = 0;
-	char buf[128];
-	value_t pgpinout[2];
-	value_t pgfaults[2];
+#define STR_STARTS_WITH(a, b) strncmp (a, b, strlen (b))
 
 	while (fgets (buf, sizeof (buf), fh) != NULL)
 	{
@@ -159,10 +246,11 @@ static void read_memory_stat (const char *cgroup_name,
                 int numfields = 0;
 		value_t value;
 
-		if (strncmp (buf, "total_", strlen ("total_")) == 0) 
+
+		if (STR_STARTS_WITH (buf, "total_") == 0) 
 			continue;
 
-		if (strncmp (buf, "hierarchical_", strlen ("hierarchical_")) == 0)
+		if (STR_STARTS_WITH (buf, "hierarchical_") == 0)
 			continue;
 
 		strstripnewline (buf);
@@ -172,62 +260,56 @@ static void read_memory_stat (const char *cgroup_name,
 
 		if (strcmp (fields[0], "pgpgin") == 0)
 		{
-			if (parse_value (fields[1], pgpinout[0], DS_TYPE_DERIVE))
-			{
+			if (parse_value (fields[1], &inout[0], DS_TYPE_DERIVE))
 				parsed_values |= GOT_PGPGIN;
-			}
 		}
 		else if (strcmp (fields[0], "pgpgout") == 0)
 		{
-			if (parse_value (fields[1], pgpinout[1], DS_TYPE_DERIVE))
-			{
+			if (parse_value (fields[1], &inout[1], DS_TYPE_DERIVE))
 				parsed_values |= GOT_PGPGOUT;
-			}
 		}
 		else if (strcmp (fields[0], "pgfault") == 0)
 		{
-			if (parse_value (fields[1], pgfaults[0], DS_TYPE_DERIVE))
-			{
+			if (parse_value (fields[1], &faults[0], DS_TYPE_DERIVE))
 				parsed_values |= GOT_PGFAULT;
-			}			
 		}
 		else if (strcmp (fields[0], "pgmajfault") == 0)
 		{
-			if (parse_value (fields[1], pgfaults[1], DS_TYPE_DERIVE))
-			{
+			if (parse_value (fields[1], &faults[1], DS_TYPE_DERIVE))
 				parsed_values |= GOT_PGMAJFAULT;
-			}
 		}
 		else
 		{
-			value_t npages;
-
 			if (!parse_value (fields[1], &value, DS_TYPE_GAUGE))
 			{
-				WARNING ("");
+				DEBUG ("cgroups plugin: unable to parse numeric"
+						"value from field ");
 				continue;
 			}
 
-			npages = convert_to_pages(value);
-			cgroups_submit_one (cgroup_name, "vmpage_number", fields[0], npages);
+			cgroups_submit_one (cgroup_name, "vmpage_number", 
+					fields[0], bytes_to_numpages(value));
 		}
 	}
 
-	if (parsed_values & (GOT_PGPGIN | GOT_PGPGOUT) == (GOT_PGPGIN | GOT_PGPGOUT))
-	{
-		cgroups_submit_two (cgroup_name, "vmpage_io", "memory", pgpinout);
-	}
+	if (test_bits (parsed_values, GOT_PGPGIN | GOT_PGPGOUT))
+		cgroups_submit_two (cgroup_name, "vmpage_io", "memory", inout);
+	else
+		DEBUG ("cgroups plugin: page io not found in a status");
 
-	if (parsed_values & (GOT_PGFAULT | GOT_PGMAJFAULT) == (GOT_PGFAULT | GOT_PGMAJFAULT))
-	{
-		cgroups_submit_two (cgroup_name, "vmpage_faults", "", pgfaults);
-	}
-}	
+	if (test_bits (parsed_values, GOT_PGFAULT | GOT_PGMAJFAULT))
+		cgroups_submit_two (cgroup_name, "vmpage_faults", "", faults);
+	else
+		DEBUG ("cgroups plugin: page faults not found in a status");
 
 #undef GOT_PGPGIN
 #undef GOT_PGPGOUT
 #undef GOT_PGFAULT
 #undef GOT_PGMAJFAULT
+#undef STR_STARTS_WITH
+
+	return 0;
+}
 
 static int get_blkio_device (const char *buf, unsigned int *major, 
 		unsigned int *minor)
@@ -235,70 +317,76 @@ static int get_blkio_device (const char *buf, unsigned int *major,
 	unsigned long maj, min;
 	char *end;
 
-	maj = strtoul(buf, &end, 10);
+	maj = strtoul (buf, &end, 10);
 	if (end == buf || maj > 255)
-	{
-		WARNING ("");
-		return 1;
-	}
+		goto fail;
 
 	if (*end != ':')
-	{
-		WARNING ("");
-		return 1;
-	}
+		goto fail;
+
 	buf = end + 1;
 
-	min = strtoul(buf, &end, 10);
+	min = strtoul (buf, &end, 10);
         if (end == buf || min > 255)
-        {
-		WARNING ("");
-		return 1;
-        }
+		goto fail;
 
 	*major = (unsigned int) maj;
 	*minor = (unsigned int) min;
 
-	return 0;
+	return (0);
+
+fail:
+	DEBUG ("cgroups plugin: invalid block device %s");
+	return (-1);
 }
 
-static int get_blkio_value_instance (char *buf, size_t buf_size,
+static void get_blkio_value_instance (char *buf, size_t buf_size,
 		const char *prefix, unsigned int major, unsigned int minor)
 {
 	int res;
 
-	res = snprintf(buf, buf_size, "%s-%u_%u", prefix, major, minor);
-	if (res < 0) 
+	if (prefix != NULL)
 	{
-		return 1;
+		res = ssnprintf(buf, buf_size, "%s_%u:%u", prefix, major, minor);
+		if (res >= buf_size)
+			DEBUG ("cgroups plugin: truncated value %s_%u:%u",
+					prefix, major, minor);
 	}
-
-	return 0;
+	else
+	{
+		res = ssnprintf(buf, buf_size, "%u:%u", major, minor);	
+		if (res >= buf_size)
+			DEBUG ("cgroups plugin: truncated value %u:%u",
+					major, minor); 
+	}
 }
 
 __attribute__ ((nonnull(1)))
 __attribute__ ((nonnull(2)))
-static void read_blkio_rw (const char *cgroup, void *payload, FILE *fh)
+__attribute__ ((nonnull(4)))
+static int __read_blkio_rw (const char *cgroup, FILE *fh, const char *prefix,
+		const char *value_type)
 {
 	unsigned long parsed_values = 0;
-	const char *prefix = payload->prefix;
-	const char *value_type = payload->value_type;
 	char buf[128];
-	unsigned int blkdev[2];
+	unsigned blkdev[2];
 	value_t rw[2];
+
+#define GOT_READ	0x01
+#define GOT_WRITE	0x02
 
 	while (fgets (buf, sizeof (buf), fh) != NULL)
 	{
                 char *fields[4];
                 int numfields; 
-		unsigned int min = 0, maj = 0; 
+		unsigned min = 0, maj = 0; 
 
 		strstripnewline (buf);
-		numfields = strsplit (buf, &fields, STATIC_ARRAY_SIZE (fields));
+		numfields = strsplit (buf, fields, STATIC_ARRAY_SIZE (fields));
 		if (numfields != 3)
 			continue;
 
-		if (!get_blk_device (fields[0], &maj, &min))
+		if (!get_blkio_device (fields[0], &maj, &min))
 			continue;
 		
 		if (maj != blkdev[0] || min != blkdev[1])
@@ -310,35 +398,61 @@ static void read_blkio_rw (const char *cgroup, void *payload, FILE *fh)
 
 		if (strcmp (fields[1], "Read") == 0)
 		{
-			if (!parse_value (fields[2], rw[0], DS_TYPE_DERIVE))
-			{
-				WARNING ("");
-			}
+			if (parse_value (fields[2], &rw[0], DS_TYPE_DERIVE))
+				parsed_values |= GOT_READ;
+			else
+				DEBUG ("cgroups plugin: unable to parse "
+						"blkio %s on device %u:%u.",
+						"reads", maj, min);
 		}
 		else if (strcmp (fields[1], "Write") == 0)
 		{
-			if (!parse_value (fields[2], rw[1], DS_TYPE_DERIVE))
-			{
-				WARNING ("");
-			}
+			if (parse_value (fields[2], &rw[1], DS_TYPE_DERIVE))
+				parsed_values |= GOT_WRITE;
+			else
+				DEBUG ("cgroups plugin: unable to parse "
+						"blkio %s on device %u:%u.",
+						"writes", maj, min);
 		}
 
-		if (parsed_values & (GOT_READ | GOT_WRITE) == GOT_READ | GOT_WRITE)
+		if (test_bits (parsed_values, GOT_READ | GOT_WRITE))
 		{
-			char instance[64];
+			char instance[DATA_MAX_NAME_LEN];
 			
-			if (!get_blkio_value_instance (&instance, sizeof(instance), prefix, maj, min))
-			{
-				continue;
-			}
-
+			get_blkio_value_instance (instance, sizeof(instance), 
+					prefix, maj, min);
 			cgroups_submit_two (cgroup, value_type, instance, rw);
 		}
 	}
+
+#undef GOT_READ
+#undef GOT_WRITE
+
+	return 0;
 }
 
-static void __read_blkio_single (const char *cgroup, const char *prefix, 
-		const char *value_type, FILE *fh)
+__attribute__ ((nonnull(1)))
+__attribute__ ((nonnull(2)))
+__attribute__ ((nonnull(3)))
+static int read_blkio_rw_no_prefix (const char *cgroup, FILE *fh, void *payload,
+                void __attribute__((unused)) *custom_data)
+{
+	return __read_blkio_rw (cgroup, fh, NULL, (const char *) payload);
+}
+
+__attribute__ ((nonnull(1)))
+__attribute__ ((nonnull(2)))
+__attribute__ ((nonnull(3)))
+static int read_blkio_rw (const char *cgroup, FILE *fh, void *payload,
+                void __attribute__((unused)) *custom_data)
+{
+        cgroup_handler_info_t *i = (cgroup_handler_info_t *) payload;
+
+	return __read_blkio_rw (cgroup, fh, i->value_prefix, i->value_type);
+}
+
+static int __read_blkio_single (const char *cgroup, FILE *fh,
+		const char *prefix, const char *value_type)
 {
 	char buf[128];
 
@@ -359,368 +473,426 @@ static void __read_blkio_single (const char *cgroup, const char *prefix,
 			continue;
 
 		if (!parse_value (fields[1], &value, DS_TYPE_GAUGE))
+		{
+			DEBUG ("cgroups plugin: unable to parse value: %s"
+					"on blkio device %u:%u",
+					fields[1], maj, min);
 			continue;
+		}
 
-		if (!get_blkio_value_instance (&instance, sizeof(instance), 
-				prefix, maj, min))
-			continue;
-
+		get_blkio_value_instance (instance, sizeof(instance), 
+				prefix, maj, min);
 		cgroups_submit_one (cgroup, value_type, instance, value);
 	}
+
+	return 0;
+}
+/*
+__attribute__ ((nonnull(1)))
+__attribute__ ((nonnull(2)))
+__attribute__ ((nonnull(3)))
+static int read_blkio_single_no_prefix (const char *cgroup, FILE *fh, 
+		void *payload, void __attribute__((unused)) *custom_data)
+{
+	return __read_blkio_single (cgroup, fh, NULL, (const char *) payload);
+}
+*/
+__attribute__ ((nonnull(1)))
+__attribute__ ((nonnull(2)))
+__attribute__ ((nonnull(3)))
+static int read_blkio_single (const char *cgroup, FILE *fh,
+		void *payload, void __attribute__((unused)) *custom_data)
+{
+	cgroup_handler_info_t *i = (cgroup_handler_info_t *) payload;
+
+	return __read_blkio_single (cgroup, fh, i->value_prefix, i->value_type);
 }
 
 __attribute__ ((nonnull(1)))
 __attribute__ ((nonnull(2)))
-static void read_blkio_single_no_prefix (const char *cgroup, void *payload, 
-		FILE *fh)
+__attribute__ ((nonnull(3)))
+static int __read_simple_value (const char *cgroup, FILE *fh, 
+		cgroup_handler_info_t *info, int ds_type, 
+		const char *custom_prefix)
 {
-	__read_blkio_single (cgroup, "", (char *)payload, fh);
-}
-
-__attribute__ ((nonnull(1)))
-__attribute__ ((nonnull(2)))
-static void read_blkio_single (const char *cgroup, void *payload, FILE *fh)
-{
-	cgroup_handler_s *info = (cgroup_handler_s *) payload;
-
-	__read_blkio_single (cgroup, info->value_prefix, info->value_type, fh);
-}
-
-static void __read_simple_value (const char *cgroup, 
-		cgroup_handler_info_s *info, FILE *fh, int ds_type)
-{
-	char buf[16];
 	value_t value;
+	const char *type_instance;
+	char buf[16];
+	char combined_prefix[DATA_MAX_NAME_LEN];
 
 	if (!fgets (buf, sizeof (buf), fh))
-		return;
+		return (-1);
 
 	strstripnewline (buf);
 	if (!parse_value (buf, &value, ds_type))
-		return;
+		return (-1);
 
-	cgroups_submit_one (cgroup, info->value_type, info->value_prefix,
-		value);
+	if (custom_prefix != NULL)
+	{
+		if (info->value_prefix != NULL)
+		{
+			int res = ssnprintf (combined_prefix, 
+					sizeof (combined_prefix), "%s_%s", 
+					custom_prefix, info->value_prefix);
+
+			if (res >= sizeof (combined_prefix))
+				DEBUG ("cgroup plugin: instance type "
+						"truncated %s_%s",
+						custom_prefix, 
+						info->value_prefix);
+
+			type_instance = combined_prefix;
+		}
+		else
+			type_instance = custom_prefix;
+	}
+	else
+		type_instance = info->value_prefix;
+
+	cgroups_submit_one (cgroup, info->value_type, type_instance, value);
+	
+	return 0;
 }
 
 __attribute__ ((nonnull(1)))
 __attribute__ ((nonnull(2)))
-static void read_simple_derive_cb(const char *cgroup, void *user_data, FILE *fh)
+__attribute__ ((nonnull(3)))
+static int read_simple_derive (const char *cgroup, FILE *fh, void *payload, 
+		void *custom_data)
 {
-	__read_simple_value (fh, (cgroup_handler_info_s *) user_data, cgroup, 
-			ds_type, DS_TYPE_DERIVE);
+	cgroup_handler_info_t *info = (cgroup_handler_info_t *) payload;
+
+	return	__read_simple_value (cgroup, fh, info, DS_TYPE_DERIVE,
+			custom_data);
 }
 
 __attribute__ ((nonnull(1)))
 __attribute__ ((nonnull(2)))
-static void read_simple_gauge_cb(const char *cgroup, void *user_data, FILE *fh)
+__attribute__ ((nonnull(3)))
+static int read_simple_gauge (const char *cgroup, FILE *fh, void *payload,
+		void *custom_data)
 {
-	__read_simple_value (fh, (cgroup_handler_info_s *) user_data, cgroup, 
-			ds_type, DS_TYPE_GAUGE);
+	cgroup_handler_info_t *info = (cgroup_handler_info_t *) payload;
+
+	return __read_simple_value (cgroup, fh, info, DS_TYPE_GAUGE,
+			custom_data);
 }
 
-static const char *DISK_MERGED = "disk_merged";
-static const char *DISK_OCTETS = "disk_octets";
-static const char *DISK_OPS = "disk_ops";
-static const char *DISK_TIME = "disk_time";
-static const char *DISK_OCTETS_THROTTLE = "disk_throttle_octets";
-static const char *DISK_OPS_THROTTLE = "disk_throttle_ops";
-static const char *MEMORY = "memory";
-static const char *VMPAGE_ACTION = "vmpage_action";
-
-static const cgroup_handler_s cpuacct[]
+static const cgroup_handler_t cpuacct[] =
 {
 	{
 		.filename	= "stat",
-		.handler	= read_cpuacct_stat,
-		.payload	=  NULL,
+		.func		= read_cpuacct_stat,
+		.payload	= NULL,
 	},
 };
 /*
-static const cgroup_handler_info_s blkio_queued_info =
+static const cgroup_handler_info_t blkio_queued_info =
 {
-        .value_type     = DISK_OPS,
+        .value_type     = "disk_ops",
         .value_prefix	= "queued",
 };
 */
 /*
-static const cgroup_handler_info_s blkio_wait_info =
+static const cgroup_handler_info_t blkio_wait_info =
 {
-        .value_type     = DISK_TIME,
+        .value_type     = "disk_latency",
         .value_prefix	= "wait",
 };
 */
-static const cgroup_handler_s blkio[]
+static const cgroup_handler_t blkio[] =
 {
 	{
 		.filename	= "io_merged",
-		.handler	= read_blkio_rw_no_prefix,
-		.payload	= DISK_MERGED,
+		.func		= read_blkio_rw_no_prefix,
+		.payload	= "disk_merged",
 	},
 /*
 	{
 		.filename	= "io_queued",
-		.handler	= read_blkio_rw,
-		.payload	= &blkio_queued_info,
+		.func		= read_blkio_rw,
+		.payload	= blkio_queued_info,
 	},
 */
 	{
 		.filename	= "io_service_bytes",
-		.handler	= read_blkio_rw_no_prefix, 
-		.payload	= DISK_OCTETS,
+		.func		= read_blkio_rw_no_prefix, 
+		.payload	= "disk_octets",
 	},
 	{
 		.filename	= "io_service_time",
-		.handler	= read_blkio_rw_no_prefix,
-		.payload	= DISK_TIME,
+		.func		= read_blkio_rw_no_prefix,
+		.payload	= "disk_time",
 	},
 	{
 		.filename	= "io_serviced",
-		.handler	= read_blkio_rw_no_prefix,
-		.payload	= DISK_OPS,
+		.func		= read_blkio_rw_no_prefix,
+		.payload	= "disk_ops",
 	},
 /*	
 	{
 		.filename	= "io_wait_time",
-		.handler	= read_blkio_rw,
-		.payload	= &blkio_wait_info,
+		.func		= read_blkio_rw,
+		.payload	= blkio_wait_info,
 	}
 */
 };
 
-static const cgroup_handler_info_s failcnt_info =
+static const cgroup_handler_info_t throttle_bytes_data =
 {
-        .value_type     = DISK_OCTETS,
+        .value_type     = "disk_octets",
         .value_prefix	= "throttled",
 };
 
-static const cgroup_handler_info_s failcnt_info =
+static const cgroup_handler_info_t throttle_iops_data =
 {
-        .value_type     = DISK_OPS,
+        .value_type     = "disk_ops",
         .value_prefix	= "throttled",
 };
 
-static const cgroup_handler_info_s failcnt_info =
+static const cgroup_handler_info_t throttle_read_bytes =
 {
-        .value_type     = DISK_OCTETS_THROTTLE,
+        .value_type     = "bytes",
         .value_prefix	= "throttle_read",
 };
 
-static const cgroup_handler_info_s failcnt_info =
+static const cgroup_handler_info_t throttle_read_ops =
 {
-        .value_type     = DISK_OPS_THROTTLE,
+        .value_type     = "requests",
         .value_prefix	= "throttle_read",
 };
 
-static const cgroup_handler_info_s failcnt_info =
+static const cgroup_handler_info_t throttle_write_bytes =
 {
-        .value_type     = DISK_OCTETS_THROTTLE,
+        .value_type     = "bytes",
         .value_prefix	= "throttle_write",
 };
 
-static const cgroup_handler_info_s failcnt_data =
+static const cgroup_handler_info_t throttle_write_ops =
 {
-        .value_type     = DISK_OPS_THROTTLE,
+        .value_type     = "requests",
         .value_prefix	= "throttle_write",
 };
 
-static const cgroup_handler_s blkio_throttle[]
+static const cgroup_handler_t blkio_throttle[] =
 {
 	{
 		.filename	= "io_service_bytes",
-		.handler	= read_blkio_rw,
-		.payload	= &throttle_bytes_data,
+		.func		= read_blkio_rw,
+		.payload	= (void *) &throttle_bytes_data,
 	},
 	{
 		.filename	= "io_serviced",
-		.handler	= read_blkio_rw,
-		.payload	= &throttle_iops_data,
+		.func		= read_blkio_rw,
+		.payload	= (void *) &throttle_iops_data,
 	},
 	{
 		.filename	= "read_bps_device",
-		.handler	= read_blkio_single, 
-		.payload	= &throttle_read_bytes,
+		.func		= read_blkio_single, 
+		.payload	= (void *) &throttle_read_bytes,
 	},
 	{
 		.filename	= "read_iops_device",	
-		.handler	= read_blkio_single, 
-		.payload	= &throttle_read_ops,
+		.func		= read_blkio_single, 
+		.payload	= (void *) &throttle_read_ops,
 	},
 	{
 		.filename	= "write_bps_device",
-		.handler	= read_blkio_single,
-		.payload	= &throttle_write_bytes,
+		.func		= read_blkio_single,
+		.payload	= (void *) &throttle_write_bytes,
 	},
 	{
 		.filename	= "write_iops_device",
-		.handler	= read_blkio_single,
-		.payload	= &throttle_write_bytes,
+		.func		= read_blkio_single,
+		.payload	= (void *) &throttle_write_ops,
 	}
 };
 
-static const cgroup_handler_info_s failcnt_info = 
+static const cgroup_handler_info_t failcnt_info = 
 {	
-	.value_type	= VMPAGE_ACTION,
-	.value_prefix	= "failcnt",
+	.value_type	= "vmpage_faults",
+	.value_prefix	= NULL,
 };
 
-static const cgroup_handler_info_s usage_info = 
+static const cgroup_handler_info_t usage_info = 
 {
-	.value_type	= MEMORY,
-	.value_prefix	= "usage",
+	.value_type	= "memory",
+	.value_prefix	= "used",
 };
 
-static const cgroup_handler_info_s usage_watermark_info = 
+static const cgroup_handler_info_t usage_watermark_info = 
 {
-	.value_type	= MEMORY,
+	.value_type	= "memory",
 	.value_prefix	= "usage_watermark",
 };
 
-static const cgroup_handler_info_s usage_limit_info = 
+static const cgroup_handler_info_t usage_softlimit_info = 
 {
-	.value_type	= MEMORY,
+	.value_type	= "memory",
+	.value_prefix	= "usage_softlimit",
+};
+
+static const cgroup_handler_info_t usage_limit_info = 
+{
+	.value_type	= "memory",
 	.value_prefix	= "usage_limit",
 };
 
-static const cgroup_handler_s memory[] 
+static const cgroup_handler_t memory[] =
 {
 	{
 		.filename	= "failcnt",
-		.handler	= read_simple_derive, 
-		.payload	= &failcnt_info,
+		.func		= read_simple_derive, 
+		.payload	= (void *) &failcnt_info,
 	},
 	{
 		.filename	= "usage_in_bytes",
-		.handler	= read_simple_gauge,
-		.payload	= &usage_info,
+		.func		= read_simple_gauge,
+		.payload	= (void *) &usage_info,
 	},
 	{
 		.filename	= "max_usage_in_bytes",
-		.handler	= read_simple_gauge,
-		.payload	= &usage_watermark_info,
+		.func		= read_simple_gauge,
+		.payload	= (void *) &usage_watermark_info,
 	},
 	{
 		.filename	= "soft_limit_in_bytes",
-		.handler	= read_simple_gauge,
-		.payload	= &usage_softlimit_info,
+		.func		= read_simple_gauge,
+		.payload	= (void *) &usage_softlimit_info,
 	},
 	{
 		.filename	= "limit_in_bytes",
-		.handler	= read_simple_gauge,
-		.payload	= &usage_limit_info,
+		.func		= read_simple_gauge,
+		.payload	= (void *) &usage_limit_info,
 	},
 };
 
-static const cgroup_handler_s memory_stat[]
+static const cgroup_handler_t memory_stat[] =
 {
 	{
 		.filename	= "stat",
-		.handler	= read_memory_stat,
+		.func		= read_memory_stat,
 		.payload	= NULL,
 	},
 /*	
 	{
 		.filename	= "numa.stat",
-		.handler	=  read_memory_numa_stat,
+		.func		=  read_memory_numa_stat,
 		.payload	=  NULL
 	},
 */
 };
 
-static const cgroup_handler_s memory_extended[]
+static const cgroup_handler_t memory_ext[] =
 {
 	{
 		.filename	= "failcnt",
-		.handler	= read_simple_derive,
-		.payload	= &failcnt_info,
+		.func		= read_simple_derive,
+		.payload	= (void *) &failcnt_info,
 	},
 	{
 		.filename	= "usage_in_bytes",
-		.handler	= read_simple_gauge,
-		.payload	= &usage_info,
+		.func		= read_simple_gauge,
+		.payload	= (void *) &usage_info,
 	},
 	{
 		.filename	= "max_usage_in_bytes",
-		.handler	= read_simple_gauge,
-		.payload	= &usage_watermark_info,
+		.func		= read_simple_gauge,
+		.payload	= (void *) &usage_watermark_info,
 	},
 	{
 		.filename	= "limit_in_bytes",
-		.handler	= read_simple_gauge,
-		.payload	= &usage_limit_info,
+		.func		= read_simple_gauge,
+		.payload	= (void *) &usage_limit_info,
 	},
 };
 
-static void handle_subsystem(const cgroup_subsystem_handler_s **handlers,
+__attribute__ ((nonnull(1)))
+__attribute__ ((nonnull(3)))
+__attribute__ ((nonnull(4)))
+__attribute__ ((nonnull(5)))
+static int handle_subsystem(const cgroup_handler_t *handlers,
 		size_t num_handlers, const char *mountpoint,
 		const char *cgroup_name, const char *subsystem_name,
-		const char *prefix)
+		void *custom_data)
 {
-	for (size_t n = 0; n < num_handlers; n++)
+	int fails = 0;
+	size_t n;
+
+	for (n = 0; n < num_handlers; n++)
 	{
-		FILE *file;
-		cgroup_handler_s *h;
+		FILE *fh;
+		cgroup_handler_t h = handlers[n];
 		char path[PATH_MAX];
 
 		ssnprintf (path, sizeof (path), "%s/%s/%s.%s", mountpoint,
-				cgroup_name, subsystem_name, h->filename);
+				cgroup_name, subsystem_name, h.filename);
 
-		if (!(file = fopen (path, "r")))
+		if (!(fh = fopen (path, "r")))
+		{
+			WARNING ("cgroup plugin: Unable to open file: %s", 
+					path);
+			fails++;
 			continue;
+		}
 
-		h->handler (cgroup_name, h->payload, fh, prefix);
+		if (!h.func (cgroup_name, fh, h.payload, custom_data))
+			fails++;
 
-		fclose (file);
+		fclose (fh);
 	}
+
+	return (num_handlers - fails);
 }
 
-static int do_cgroup (const char *mountpoint, char const *cgroup_name,
-		unsigned long subsystems)
+static void do_cgroup (const char *mountpoint, char const *cgroup_name,
+		unsigned long mounted_subsystems)
 {
-	int status;
-
 	if (ignorelist_match (il_cgroup, cgroup_name))
-		return (0);
+		return;
 
-	if (subsystems & CGROUP_CPUACCT)
+#define DO_SUBSYSTEM(subsystem, handlers, subsystem_name, custom_data) do { \
+	if (do_subsystems & subsystem) { \
+		int succ = handle_subsystem (handlers, \
+				STATIC_ARRAY_SIZE (handlers), mountpoint, \
+				cgroup_name, subsystem_name, custom_data); \
+		if (succ <= 0) \
+			do_subsystems &= ~subsystem; \
+	} \
+} while (0); 
+
+	if (mounted_subsystems & CGROUP_SUBSYSTEM_CPUACCT)
 	{
-		handle_subsystem (cpuacct, mountpoint, cgroup_name, "cpuacct", 
-				"");
+		DO_SUBSYSTEM (CGROUP_DO_CPUACCT_BASIC, cpuacct, "cpuacct", NULL);
 	}
 
-	if (subsystems & CGROUP_MEMORY)
+	if (mounted_subsystems & CGROUP_SUBSYSTEM_MEMORY)
 	{
-		handle_subsystem (memory, mountpoint, cgroup_name, "memory", 
-				"");
+		DO_SUBSYSTEM (CGROUP_DO_MEMORY_BASIC, memory, "memory", NULL);
 
-		if (memory_extended)
-			handle_subsystem (memory_stat, mountpoint, cgroup_name, 
-					"memory", "");
+		DO_SUBSYSTEM (CGROUP_DO_MEMORY_STAT, memory_stat, "memory", 
+				NULL);
 
-		if (memory_extended)
-			handle_subsystem (memory_extended, mountpoint, 
-					cgroup_name, "memory.kmem", "kmem_");
+		DO_SUBSYSTEM (CGROUP_DO_MEMORY_KERNEL, memory_ext, 
+				"memory.kmem", "kernel_");
 
-		if (memory_extended)
-			handle_subsystem (memory_extended, mountpoint, 
-					cgroup_name, "memory.kmem.tcp", 
-					"kmem_tcp_");
+		DO_SUBSYSTEM (CGROUP_DO_MEMORY_TCP, memory_ext, 
+				"memory.kmem.tcp", "tcp_");
 
-		if (memory_extended)
-			handle_subsystem (memory_extended, mountpoint, 
-					cgroup_name, "memory.memsw", "memsw_");
+		DO_SUBSYSTEM (CGROUP_DO_MEMORY_SWAP, memory_ext, 
+				"memory.memsw", "memsw_");
 	}
 
-	if (subsystems & CGROUP_BLKIO)
+	if (mounted_subsystems & CGROUP_SUBSYSTEM_BLKIO)
 	{
-		handle_subsystem (blkio, mountpoint, cgroup_name, "blkio", "");
+		DO_SUBSYSTEM (CGROUP_DO_BLKIO_BASIC, blkio, "blkio", NULL);
 
-		if (blkio_thtottling)
-			handle_subsystem (blkio_throttle, mountpoint, 
-					cgroup_name, "blkio.throttle", "");
+		DO_SUBSYSTEM (CGROUP_DO_BLKIO_THROTTLE, blkio_throttle, 
+				"blkio.throttle", NULL);
 	}
 
-	return (0);
+#undef DO_SUBSYSTEM
+
 } /* int read_cpuacct_procs */
 
 /*
@@ -736,17 +908,14 @@ static int cgroups_read_root_dir (const char *dirname, const char *filename,
 
 	ssnprintf (abs_path, sizeof (abs_path), "%s/%s", dirname, filename);
 
-	status = lstat (abs_path, &statbuf);
-	if (status != 0)
+	if (!lstat (abs_path, &statbuf))
 	{
 		ERROR ("cgroups plugin: stat (%s) failed.", abs_path);
 		return (-1);
 	}
 
 	if (S_ISDIR (statbuf.st_mode))
-	{
 		do_cgroup (dirname, filename, (unsigned long) user_data);
-	}
 
 	return (0);
 }
@@ -759,15 +928,18 @@ static int cgroups_init (void)
 		il_cgroup = ignorelist_create (1);
 
 	pagesize = sysconf (_SC_PAGESIZE);
-	if (pagesize < 0)
-	{
-		ERROR ("cgroups plugin: getting size of a page failed, using default 4096.");
-		pagesize = 4096L;
-	}
+	if (pagesize <= 0)
+		goto init_failed;
 
 	pageshift = ffs (pagesize);
+	if (pageshift <= 0)
+		goto init_failed;
 
 	return (0);
+
+init_failed:
+	ERROR ("cgroups plugin: unable to determine system pagesize.");
+	return (-1);
 }
 
 static int cgroups_config (const char *key, const char *value)
@@ -788,6 +960,21 @@ static int cgroups_config (const char *key, const char *value)
 			ignorelist_set_invert (il_cgroup, 1);
 		return (0);
 	}
+	else if (strcasecmp (key, "Subsystem") == 0)
+	{
+		int i;
+
+		for (i = 0; i < STATIC_ARRAY_SIZE (cgroup_set_str); i++)
+		{
+			if (strcmp(value, cgroup_set_str[i]))
+			{
+				do_subsystems |= 1UL << i;
+				return (0);
+			}
+		}
+
+		return (1);
+	}
 
 	return (-1);
 }
@@ -807,18 +994,19 @@ static int cgroups_read (void)
 
 	for (mnt_ptr = mnt_list; mnt_ptr != NULL; mnt_ptr = mnt_ptr->next)
 	{
+		int i;
 		unsigned long mounted_subsystems = 0;
 
 		/* Find the cgroup mountpoints. */
-		if (strcmp(mnt_ptr->type, "cgroup") != 0)
+		if (strcmp (mnt_ptr->type, "cgroup") != 0)
 			continue;
 
-		for (size_t n = 0; n < STATIC_ARRAY_SIZE (subsystems); n++)
+		for (i = 0; i < STATIC_ARRAY_SIZE (cgroup_subsystem_str); i++)
 		{
 			if (cu_mount_getoptionvalue (mnt_ptr->options, 
-					subsystems[i]))
+					cgroup_subsystem_str[i]))
 			{
-				mounted_subsystems |= 1 << n; 
+				mounted_subsystems |= 1UL << i; 
 			}
 		}
 
@@ -826,7 +1014,7 @@ static int cgroups_read (void)
 			continue;
 
 		walk_directory (mnt_ptr->dir, cgroups_read_root_dir, 
-				mounted_subsystems, /* include_hidden = */ 0);
+				(void *) mounted_subsystems, /* include_hidden = */ 0);
 
 		cgroup_found = 1;
 	}
