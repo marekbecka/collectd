@@ -922,18 +922,21 @@ static int cgroups_read_root_dir (const char *dirname, const char *filename,
 
 static int cgroups_init (void)
 {
-	long pagesize;
-
 	if (il_cgroup == NULL)
 		il_cgroup = ignorelist_create (1);
 
-	pagesize = sysconf (_SC_PAGESIZE);
-	if (pagesize <= 0)
-		goto init_failed;
+	if (pageshift == 0)
+	{
+		long pagesize;
 
-	pageshift = ffs (pagesize);
-	if (pageshift <= 0)
-		goto init_failed;
+		pagesize = sysconf (_SC_PAGESIZE);
+		if (pagesize <= 0)
+			goto init_failed;
+
+		pageshift = ffs (pagesize);
+		if (pageshift <= 0)
+			goto init_failed;
+	}
 
 	return (0);
 
@@ -964,9 +967,15 @@ static int cgroups_config (const char *key, const char *value)
 	{
 		int i;
 
+		if (strcmp (value, "*") == 0)
+		{
+			do_subsystems = CGROUP_DO_ALL;
+			return (0);
+		}
+
 		for (i = 0; i < STATIC_ARRAY_SIZE (cgroup_set_str); i++)
 		{
-			if (strcmp(value, cgroup_set_str[i]))
+			if (strcmp(value, cgroup_set_str[i]) == 0)
 			{
 				do_subsystems |= 1UL << i;
 				return (0);
