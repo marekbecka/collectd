@@ -102,6 +102,8 @@ typedef struct diskstats
 	derive_t avg_read_time;
 	derive_t avg_write_time;
 
+	derive_t io_time;
+
 	struct diskstats *next;
 } diskstats_t;
 
@@ -313,6 +315,32 @@ static void submit_io_time (char const *plugin_instance, derive_t io_time, deriv
 	plugin_dispatch_values (&vl);
 }
 
+static void submit_utilization (char const *plugin_instance, derive_t delta_time)
+{
+	long interval;
+	value_t v;
+	value_list_t vl = VALUE_LIST_INIT;
+
+	if (ignorelist_match (ignorelist, plugin_instance) != 0)
+		return;
+
+	interval = CDTIME_T_TO_MS (plugin_get_interval ());
+	if (interval == 0) {
+		DEBUG ("disk plugin: got zero plugin interval");
+		return;
+	}
+	
+	v.gauge = ((delta_time / (double)interval) * 100.0);
+	vl.values = &v;
+	vl.values_len = 1;
+	sstrncpy (vl.host, hostname_g, sizeof (vl.host));
+	sstrncpy (vl.plugin, "disk", sizeof (vl.plugin));
+	sstrncpy (vl.plugin_instance, plugin_instance, sizeof (vl.plugin_instance));
+	sstrncpy (vl.type, "percent", sizeof (vl.type));
+	sstrncpy (vl.type_instance, "utilization", sizeof (vl.type_instance));
+
+	plugin_dispatch_values (&vl);
+}
 
 static counter_t disk_calc_time_incr (counter_t delta_time, counter_t delta_ops)
 {
@@ -526,6 +554,7 @@ static int disk_read (void)
 	derive_t write_time    = 0;
 	gauge_t in_progress    = NAN;
 	derive_t io_time       = 0;
+	derive_t io_time_delta = 0;
 	derive_t weighted_time = 0;
 	int is_disk = 0;
 
@@ -686,10 +715,17 @@ static int disk_read (void)
 				ds->avg_write_time += disk_calc_time_incr (
 						diff_write_time, diff_write_ops);
 
+			if (io_time < ds->io_time)
+				io_time_delta = 1 + io_time
+					+ (UINT_MAX - ds->io_time);
+			else
+				io_time_delta = io_time - ds->io_time;
+
 			ds->read_ops = read_ops;
 			ds->read_time = read_time;
 			ds->write_ops = write_ops;
 			ds->write_time = write_time;
+			ds->io_time = io_time;
 		} /* if (is_disk) */
 
 		/* Don't write to the RRDs if we've just started.. */
@@ -738,6 +774,7 @@ static int disk_read (void)
 					read_merged, write_merged);
 			submit_in_progress (output_name, in_progress);
 			submit_io_time (output_name, io_time, weighted_time);
+			submit_utilization (output_name, io_time_delta);
 		} /* if (is_disk) */
 
 		/* release udev-based alternate name, if allocated */
